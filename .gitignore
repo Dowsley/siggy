@@ -1,9 +1,11 @@
 /target
-Cargo.lock
 *.swp
 *.swo
 *~
 .DS_Store
+Thumbs.db
+.vscode/
+.idea/
 docs/book/
 docs/plans/
 siggy-debug.log
