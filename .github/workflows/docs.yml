@@ -28,7 +28,7 @@ jobs:
       - name: Build
         run: |
           mdbook build docs
-          cp docs/CNAME docs/book/CNAME
+          [ -f docs/CNAME ] && cp docs/CNAME docs/book/CNAME || true
 
       - uses: actions/configure-pages@v5
 
