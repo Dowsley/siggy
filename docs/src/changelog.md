@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.3.3
+
+### Bug fixes
+
+- **Kitty image ghosting** -- images that scrolled out of view persisted on
+  screen. Now deletes all Kitty placements before each redraw (#180)
+- **Kitty image stretching** -- partially visible images were scaled into fewer
+  rows instead of being cropped. Now uses Kitty source-rect params to crop at
+  the pixel level (#180)
+- **Kitty image flickering** -- images were deleted and re-transmitted every
+  frame even when unchanged. Now tracks the previous frame's visible images
+  and skips redundant redraws (#180)
+- **Native image cache consistency** -- the first visible height would win in
+  the cache, producing wrong results at different sizes. Images are now always
+  encoded at full dimensions and cropped at display time (#180)
+
+### Enhancements
+
+- **Synchronized updates** -- the entire render cycle (clear + text draw +
+  image overlay) is now wrapped in a synchronized update, eliminating flash
+  on conversation switch and during scroll (#180)
+- **Suppressed Kitty responses** -- added `q=2` to Kitty graphics commands to
+  prevent response bytes from leaking into stdin (#180)
+
+Thanks to [@Dowsley](https://github.com/Dowsley) for this release.
+
+---
+
 ## v1.3.2
 
 ### Bug fixes
