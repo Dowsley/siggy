@@ -8,6 +8,9 @@ linked devices) sync into the TUI automatically.
 ## Attachments
 
 - **Images** -- rendered inline as halfblock art when `inline_images = true`
+- **Native image protocols** -- for terminals that support Kitty or iTerm2
+  graphics, enable `/settings` > "Native images" for higher-fidelity rendering
+  with proper cropping and flicker-free scrolling
 - **Other files** -- shown as `[attachment: filename]` with the download path
 - **Send files** -- use `/attach` to open a file browser and attach a file to
   your next message
