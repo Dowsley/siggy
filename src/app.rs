@@ -442,6 +442,8 @@ pub struct App {
     pub file_browser_error: Option<String>,
     /// File selected for sending as attachment
     pub pending_attachment: Option<PathBuf>,
+    /// Directory for temporary clipboard paste files (PID-scoped to avoid conflicts)
+    pub paste_temp_path: PathBuf,
     /// Reply target: (author_phone, body_snippet, timestamp_ms)
     pub reply_target: Option<(String, String, i64)>,
     /// Delete confirmation overlay visible
@@ -2817,6 +2819,16 @@ impl App {
             file_browser_filtered: Vec::new(),
             file_browser_error: None,
             pending_attachment: None,
+            paste_temp_path: {
+                let dir = std::env::temp_dir().join(format!("siggy-paste-{}", std::process::id()));
+                // Best-effort: clean any stale files from a previous run with the same PID,
+                // then recreate. Errors here are non-fatal; handle_clipboard_image re-checks.
+                let _ = std::fs::remove_dir_all(&dir);
+                if let Err(e) = std::fs::create_dir_all(&dir) {
+                    crate::debug_log::logf(format_args!("paste temp dir init failed: {e}"));
+                }
+                dir
+            },
             reply_target: None,
             show_delete_confirm: false,
             editing_message: None,
@@ -5272,18 +5284,23 @@ impl App {
                         .unwrap_or(false);
                     let conv_id = conv_id.clone();
 
-                    // Build display body with attachment prefix
-                    let display_body = if let Some(ref path) = attachment {
+                    // Build display body with attachment prefix; render inline image if applicable
+                    let (display_body, outgoing_image_lines, outgoing_image_path) = if let Some(ref path) = attachment {
                         let fname = path.file_name()
                             .map(|f| f.to_string_lossy().to_string())
                             .unwrap_or_else(|| "file".to_string());
-                        if text.is_empty() {
-                            format!("[attachment: {fname}]")
+                        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
+                        let is_image = matches!(ext.as_str(), "png" | "jpg" | "jpeg" | "gif" | "webp");
+                        let prefix = if is_image { "image" } else { "attachment" };
+                        let body = if text.is_empty() { format!("[{prefix}: {fname}]") } else { format!("[{prefix}: {fname}] {text}") };
+                        let (img_lines, img_path) = if is_image && self.inline_images {
+                            (image_render::render_image(path, 40), Some(path.to_string_lossy().into_owned()))
                         } else {
-                            format!("[attachment: {fname}] {text}")
-                        }
+                            (None, None)
+                        };
+                        (body, img_lines, img_path)
                     } else {
-                        text.clone()
+                        (text.clone(), None, None)
                     };
 
                     // Compute mention byte ranges for display styling
@@ -5324,8 +5341,8 @@ impl App {
                             timestamp: now,
                             body: display_body.clone(),
                             is_system: false,
-                            image_lines: None,
-                            image_path: None,
+                            image_lines: outgoing_image_lines,
+                            image_path: outgoing_image_path,
                             status: Some(MessageStatus::Sending),
                             timestamp_ms: local_ts_ms,
                             reactions: Vec::new(),
@@ -5675,6 +5692,9 @@ impl App {
                 } else {
                     self.status_message = "No active conversation".to_string();
                 }
+            }
+            InputAction::Paste => {
+                return self.handle_paste_command();
             }
             InputAction::Unknown(msg) => {
                 self.status_message = msg;
@@ -6056,6 +6076,85 @@ impl App {
             self.typing_sent = true;
             return self.build_typing_request(false);
         }
+        None
+    }
+
+    /// Handle text content from clipboard: file path detection or plain text insert.
+    /// Insert clipboard text into the input buffer (trimmed). Returns early with a status message
+    /// if the text is empty. File paths are treated as plain text — use `/attach` to attach files.
+    fn handle_paste_text(&mut self, text: &str) -> Option<SendRequest> {
+        let text = text.trim();
+        if text.is_empty() {
+            self.status_message = "Clipboard is empty".to_string();
+            return None;
+        }
+        self.handle_paste(text.to_string())
+    }
+
+    /// Save clipboard image data to a temp PNG file and stage it as an attachment.
+    fn handle_clipboard_image(&mut self, img_data: arboard::ImageData) -> Option<SendRequest> {
+        use image::{ImageBuffer, RgbaImage};
+
+        let width = img_data.width as u32;
+        let height = img_data.height as u32;
+
+        let img: RgbaImage = match ImageBuffer::from_raw(width, height, img_data.bytes.into_owned()) {
+            Some(img) => img,
+            None => {
+                self.status_message = "Failed to decode clipboard image".to_string();
+                return None;
+            }
+        };
+
+        let timestamp = chrono::Local::now().format("%Y%m%d_%H%M%S%.3f");
+        let filename = format!("clipboard_{timestamp}.png");
+        let path = self.paste_temp_path.join(&filename);
+
+        if let Err(e) = std::fs::create_dir_all(&self.paste_temp_path) {
+            self.status_message = format!("Cannot create paste directory: {e}");
+            return None;
+        }
+
+        if let Err(e) = img.save(&path) {
+            self.status_message = format!("Failed to save clipboard image: {e}");
+            return None;
+        }
+
+        self.pending_attachment = Some(path);
+        self.status_message = format!("Pasted image: {filename}");
+        None
+    }
+
+    /// Handle the `/paste` command: read clipboard and act on contents.
+    /// Image data → temp PNG → pending_attachment. Text → input buffer.
+    /// Note: the full clipboard-read path is not unit-tested because `arboard::Clipboard`
+    /// requires a display/compositor and cannot be mocked. The individual handlers
+    /// (`handle_clipboard_image`, `handle_paste_text`) are tested directly instead.
+    fn handle_paste_command(&mut self) -> Option<SendRequest> {
+        if self.active_conversation.is_none() {
+            self.status_message = "No active conversation".to_string();
+            return None;
+        }
+
+        let mut clipboard = match arboard::Clipboard::new() {
+            Ok(c) => c,
+            Err(e) => {
+                self.status_message = format!("Clipboard error: {e}");
+                return None;
+            }
+        };
+
+        // Try image first (screenshots add both image and file path to clipboard — prefer image)
+        if let Ok(img_data) = clipboard.get_image() {
+            return self.handle_clipboard_image(img_data);
+        }
+
+        // Try text — inserts into input buffer
+        if let Ok(text) = clipboard.get_text() {
+            return self.handle_paste_text(&text);
+        }
+
+        self.status_message = "Clipboard is empty or unsupported format".to_string();
         None
     }
 
@@ -9280,6 +9379,70 @@ mod tests {
         msg.expires_in_seconds = 3600;
         app.handle_signal_event(SignalEvent::MessageReceived(msg));
         assert_eq!(app.conversations["+1"].expiration_timer, 3600);
+    }
+
+    // --- Paste command tests ---
+
+    #[rstest]
+    fn paste_text_inserts_into_input_buffer(mut app: App) {
+        // handle_paste_text delegates to handle_paste for plain text, which guards on Insert mode
+        app.mode = InputMode::Insert;
+        app.active_conversation = Some("test-conv".to_string());
+        app.handle_paste_text("hello world");
+        assert_eq!(app.input_buffer, "hello world");
+    }
+
+    #[rstest]
+    fn paste_file_path_inserts_as_text(mut app: App) {
+        // File paths in clipboard text are treated as plain text, not auto-attached
+        let path = format!("{}/Cargo.toml", env!("CARGO_MANIFEST_DIR"));
+        app.mode = InputMode::Insert;
+        app.active_conversation = Some("test-conv".to_string());
+        app.handle_paste_text(&path);
+        assert!(app.pending_attachment.is_none());
+        assert_eq!(app.input_buffer, path);
+    }
+
+    #[rstest]
+    fn paste_empty_text_shows_status_message(mut app: App) {
+        app.active_conversation = Some("test-conv".to_string());
+        app.handle_paste_text("   ");
+        assert!(app.status_message.contains("empty"));
+        assert!(app.pending_attachment.is_none());
+        assert!(app.input_buffer.is_empty());
+    }
+
+    #[rstest]
+    fn paste_clipboard_image_saves_png_as_attachment(mut app: App) {
+        let img_data = arboard::ImageData {
+            width: 2,
+            height: 2,
+            bytes: std::borrow::Cow::Owned(vec![
+                255, 0, 0, 255,
+                0, 255, 0, 255,
+                0, 0, 255, 255,
+                255, 255, 0, 255,
+            ]),
+        };
+
+        app.active_conversation = Some("test-conv".to_string());
+        app.handle_clipboard_image(img_data);
+
+        assert!(app.pending_attachment.is_some());
+        let path = app.pending_attachment.as_ref().unwrap();
+        assert!(path.exists(), "PNG file should have been written to disk");
+        assert!(path.to_string_lossy().contains("clipboard_"));
+        assert!(path.extension().is_some_and(|e| e == "png"));
+
+        // Clean up
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[rstest]
+    fn paste_command_without_active_conversation_sets_error(mut app: App) {
+        // active_conversation is None by default in test fixture
+        app.handle_paste_command();
+        assert!(app.status_message.contains("No active conversation"));
     }
 
     // --- Typing indicator scoping ---
