@@ -8,7 +8,6 @@ Thumbs.db
 .idea/
 docs/book/
 docs/plans/
-docs/superpowers/
 siggy-debug.log
 signal-tui-debug.log
 .claude/settings.local.json
